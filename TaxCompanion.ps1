@@ -3,17 +3,25 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$AppName   = 'Tax Companion (Bangladesh) - PowerShell'
-$AppAuthor = 'rhshourav'
-$AppGitHub = 'github.com/rhshourav'
-$Version   = '1.0'
+# ============================================================
+# IT-10BB Tax Companion v2.5.0
+# Author: rhshourav
+# Repo:   https://github.com/rhshourav/IT10BB-TaxCompanion
+# ============================================================
+
+$script:AppName   = 'IT-10BB Tax Companion'
+$script:AppAuthor = 'rhshourav'
+$script:AppRepo   = 'https://github.com/rhshourav/IT10BB-TaxCompanion'
+$script:AppVersion = 'v2.5.0'
 
 function Get-DefaultConfig {
     [pscustomobject]@{
         TaxYear               = '2025-26'
         SalaryExemptionCap    = 500000
         MinimumTax            = 3000
-        FestivalBonusRatio    = 42714.0 / 344475.0
+        FestivalBonusCount    = 2
+        FestivalBonusStaffPct  = 100.0
+        FestivalBonusWorkerPct = 80.0
         RebatePctOfTaxable    = 0.03
         RebatePctOfInvestment = 0.15
         RebateMaxAmount       = 1000000
@@ -35,29 +43,40 @@ function Get-DefaultConfig {
     }
 }
 
-function Get-Config {
+function Load-Config {
+    param([string]$Path = 'config.json')
     $cfg = Get-DefaultConfig
-    if (Test-Path -LiteralPath 'config.json') {
+    if (Test-Path -LiteralPath $Path) {
         try {
-            $loaded = Get-Content -LiteralPath 'config.json' -Raw | ConvertFrom-Json
+            $loaded = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
             foreach ($p in $loaded.PSObject.Properties) {
-                if ($null -ne $p.Value -and $p.Name -ne 'SurchargeAutoTiers' -and $p.Name -ne 'TaxSlabs') {
+                if ($p.Name -ne 'SurchargeAutoTiers' -and $p.Name -ne 'TaxSlabs' -and $null -ne $p.Value) {
                     $cfg.$($p.Name) = $p.Value
                 }
             }
             if ($loaded.SurchargeAutoTiers) { $cfg.SurchargeAutoTiers = $loaded.SurchargeAutoTiers }
             if ($loaded.TaxSlabs) { $cfg.TaxSlabs = $loaded.TaxSlabs }
         } catch {
-            Write-Warning "config.json could not be read; defaults used."
+            Write-Warning 'config.json could not be read; defaults used.'
         }
     }
     return $cfg
 }
 
+function Get-FestivalBonusRate {
+    param(
+        [string]$EmployeeType
+    )
+
+    switch ((Get-Val $EmployeeType 'staff').ToLowerInvariant()) {
+        'worker' { return 80.0 }
+        default  { return 100.0 }
+    }
+}
+
 function Format-Money {
     param([double]$Value)
-    $n = [math]::Round($Value)
-    return '{0:N0}' -f $n
+    '{0:N0}' -f ([math]::Round($Value))
 }
 
 function Round-Taka {
@@ -70,10 +89,13 @@ function Test-Bool {
         [string]$Value,
         [bool]$Default = $false
     )
+
     $s = $Value
     if ($null -eq $s) { $s = '' }
     $s = $s.Trim().ToLowerInvariant()
+
     if ([string]::IsNullOrWhiteSpace($s)) { return $Default }
+
     switch ($s) {
         'y' { return $true }
         'yes' { return $true }
@@ -106,7 +128,8 @@ function Convert-HumanNumber {
 
     try {
         $dt = New-Object System.Data.DataTable
-        $dt.Compute($s, $null) | ForEach-Object { [double]$_ }
+        $result = $dt.Compute($s, $null)
+        return [double]$result
     } catch {
         return 0.0
     }
@@ -133,7 +156,9 @@ function Calculate-Tax {
         if ($remaining -le 0) { break }
 
         $amt = $remaining
-        if ($slab.Limit -gt 0 -and $amt -gt $slab.Limit) { $amt = $slab.Limit }
+        if ($slab.Limit -gt 0 -and $amt -gt $slab.Limit) {
+            $amt = $slab.Limit
+        }
 
         $tax = $amt * [double]$slab.Rate
         $total += $tax
@@ -157,8 +182,8 @@ function Calculate-Tax {
         $total = $MinimumTax
     }
 
-    [pscustomobject]@{
-        Tax  = [math]::Round($total)
+    return [pscustomobject]@{
+        Tax   = [math]::Round($total)
         Lines = $lines
     }
 }
@@ -172,45 +197,15 @@ function Calculate-Rebate {
     )
 
     if ($Taxable -le 0 -or $Investment -le 0 -or $TaxBefore -le 0) { return 0.0 }
+
     $c1 = $Taxable * [double]$Cfg.RebatePctOfTaxable
     $c2 = $Investment * [double]$Cfg.RebatePctOfInvestment
     $rebate = [math]::Min($c1, [math]::Min($c2, [double]$Cfg.RebateMaxAmount))
     $rebate = [math]::Round($rebate)
+
     if ($rebate -gt $TaxBefore) { $rebate = $TaxBefore }
     if ($rebate -lt 0) { $rebate = 0 }
     return $rebate
-}
-
-
-function Estimate-Allowances {
-    param(
-        [double]$BaseGross
-    )
-
-    if ($BaseGross -le 0) {
-        return [pscustomobject]@{
-            Basic = 0.0
-            HRA = 0.0
-            Medical = 0.0
-            Conveyance = 0.0
-        }
-    }
-
-    # Standardized display-only split for non-custom salary mode.
-    # Assumes the gross package is composed roughly as:
-    # basic 60.6%, house rent 30.3%, medical 6.1%, conveyance 3.0%
-    # This keeps the fields visible without changing the tax result.
-    $basic = [math]::Round($BaseGross / 1.65)
-    $hra = [math]::Round($basic * 0.50)
-    $medical = [math]::Round($basic * 0.10)
-    $conveyance = [math]::Round($basic * 0.05)
-
-    return [pscustomobject]@{
-        Basic = $basic
-        HRA = $hra
-        Medical = $medical
-        Conveyance = $conveyance
-    }
 }
 
 function Determine-SurchargeRate {
@@ -223,14 +218,18 @@ function Determine-SurchargeRate {
 
     if (-not $Apply -or $NetWealth -le [double]$Cfg.SurchargeThreshold) { return 0.0 }
 
-    if ([string]::IsNullOrWhiteSpace($Mode) -or $Mode.ToLowerInvariant() -eq 'auto') {
+    $modeText = $Mode
+    if ($null -eq $modeText) { $modeText = '' }
+    $modeText = $modeText.Trim().ToLowerInvariant()
+
+    if ([string]::IsNullOrWhiteSpace($modeText) -or $modeText -eq 'auto') {
         foreach ($tier in $Cfg.SurchargeAutoTiers) {
             if ($NetWealth -le [double]$tier.MaxNetWealth) { return [double]$tier.Rate }
         }
         return 0.0
     }
 
-    $p = $Mode.Trim().TrimEnd('%')
+    $p = $modeText.TrimEnd('%')
     try {
         $v = [double]::Parse($p, [System.Globalization.CultureInfo]::InvariantCulture)
         return $v / 100.0
@@ -276,7 +275,11 @@ function Compute-Allocation {
 
     if (-not $HasKids) { $weights['Education Expenses'] = 0.0 }
 
-    if ($Loc -match 'dhaka|city|metro') {
+    $locText = $Loc
+    if ($null -eq $locText) { $locText = '' }
+    $locText = $locText.ToLowerInvariant()
+
+    if ($locText -match 'dhaka|city|metro') {
         $weights['Accommodation Expense'] *= 1.20
         $weights['Food, Clothing and Essentials'] *= 1.05
         $weights['Home-Support & Other Expenses'] *= 1.10
@@ -298,7 +301,11 @@ function Compute-Allocation {
         $weights['Home-Support & Other Expenses'] *= 0.40
     }
 
-    switch ($Mode.ToLowerInvariant()) {
+    $modeText = $Mode
+    if ($null -eq $modeText) { $modeText = '' }
+    $modeText = $modeText.ToLowerInvariant()
+
+    switch ($modeText) {
         'conservative' {
             $weights['Festival, Party, Events'] *= 0.60
             $weights['Home-Support & Other Expenses'] *= 0.70
@@ -311,7 +318,8 @@ function Compute-Allocation {
         }
     }
 
-    $totalWeight = ($weights.Values | Measure-Object -Sum).Sum
+    $totalWeight = 0.0
+    foreach ($v in $weights.Values) { $totalWeight += $v }
     if ($totalWeight -le 0) {
         return [pscustomobject]@{ Pcts = @{}; Amts = @{} }
     }
@@ -360,7 +368,62 @@ function Compute-Allocation {
         }
     }
 
-    [pscustomobject]@{ Pcts = $pcts; Amts = $amts }
+    return [pscustomobject]@{ Pcts = $pcts; Amts = $amts }
+}
+
+function New-MonthlyBreakdown {
+    param(
+        [double]$MonthlyGross
+    )
+
+    if ($MonthlyGross -le 0) {
+        return [pscustomobject]@{
+            MonthlyGross      = 0.0
+            GrossAllowance    = 0.0
+            Basic             = 0.0
+            HRA               = 0.0
+            Medical           = 0.0
+            Food              = 0.0
+            Conveyance        = 0.0
+            FestivalBonus     = 0.0
+            AnnualGross       = 0.0
+        }
+    }
+
+    # Monthly salary breakdown excludes festival bonus.
+    # Core gross = gross salary
+    # Basic = gross / 1.4
+    # HRA = basic * 0.4
+    # Medical = 250
+    # Food = 650
+    # Conveyance = 200
+    $grossAllowance = [math]::Max(0, $MonthlyGross)
+    $basic = [math]::Round($grossAllowance / 1.4)
+    $hra = [math]::Round($basic * 0.4)
+    $medical = 250.0
+    $food = 650.0
+    $conveyance = 200.0
+
+    # Keep the model close to the user-supplied gross allowance.
+    $current = $basic + $hra + $medical + $food + $conveyance
+    $drift = [math]::Round($grossAllowance - $current)
+    if ($drift -ne 0) {
+        $basic += $drift
+    }
+
+    $annual = [math]::Round($MonthlyGross * 12)
+
+    return [pscustomobject]@{
+        MonthlyGross      = [math]::Round($MonthlyGross)
+        GrossAllowance    = [math]::Round($grossAllowance)
+        Basic             = [math]::Round($basic)
+        HRA               = [math]::Round($hra)
+        Medical           = [math]::Round($medical)
+        Food              = [math]::Round($food)
+        Conveyance        = [math]::Round($conveyance)
+        FestivalBonus     = 0.0
+        AnnualGross       = [math]::Round($annual)
+    }
 }
 
 function Estimate-NetFromGross {
@@ -370,7 +433,8 @@ function Estimate-NetFromGross {
         $Cfg
     )
 
-    $bonus = [math]::Round($BaseGross * [double]$Cfg.FestivalBonusRatio)
+    $bonusRate = [double]$Cfg.FestivalBonusStaffPct / 100.0
+    $bonus = [math]::Round($BaseGross * ($bonusRate / 8.4))
     $total = $BaseGross + $bonus
     $exempt = [math]::Min($total / 3.0, [double]$Cfg.SalaryExemptionCap)
     $taxable = [math]::Max(0, $total - $exempt)
@@ -415,17 +479,20 @@ function Build-Report {
         $Cfg
     )
 
-    $totalInput    = Convert-HumanNumber $Inputs.TotalSalary
+    $monthlyGrossInput = Convert-HumanNumber $Inputs.TotalSalary
     $bonusIncluded = Test-Bool $Inputs.BonusIncluded $false
-    $customSalary  = Test-Bool $Inputs.CustomSalary $false
+    $customSalary = Test-Bool $Inputs.CustomSalary $false
+    $employeeType = (Get-Val $Inputs.EmployeeType 'staff').ToLowerInvariant()
+    $festivalBonusRate = Get-FestivalBonusRate $employeeType
+    $festivalBonusCount = 2
 
-    $basic    = Convert-HumanNumber $Inputs.Basic
-    $hra      = Convert-HumanNumber $Inputs.HRA
-    $med      = Convert-HumanNumber $Inputs.Medical
-    $food     = Convert-HumanNumber $Inputs.Food
-    $trans    = Convert-HumanNumber $Inputs.Transport
-    $mobile   = Convert-HumanNumber $Inputs.Mobile
-    $festivalPct = Convert-HumanNumber $Inputs.FestivalPct
+    $customBasic = Convert-HumanNumber $Inputs.Basic
+    $customHRA = Convert-HumanNumber $Inputs.HRA
+    $customMedical = Convert-HumanNumber $Inputs.Medical
+    $customFood = Convert-HumanNumber $Inputs.Food
+    $customTransport = Convert-HumanNumber $Inputs.Transport
+    $customMobile = Convert-HumanNumber $Inputs.Mobile
+
     $totalExpense = Convert-HumanNumber $Inputs.TotalExpense
     $location = (Get-Val $Inputs.Location 'other').ToLowerInvariant()
     $familySize = [int][math]::Round((Convert-HumanNumber $Inputs.FamilySize))
@@ -434,6 +501,7 @@ function Build-Report {
     $ownHome = Test-Bool $Inputs.OwnHome $false
     $hasStaff = Test-Bool $Inputs.HasStaff $false
     $mode = (Get-Val $Inputs.Mode 'balanced').ToLowerInvariant()
+
     $prevGross = Convert-HumanNumber $Inputs.PreviousGross
     $netWealthInput = Convert-HumanNumber $Inputs.NetWealth
     $openingWealth = Convert-HumanNumber $Inputs.OpeningNetWealth
@@ -449,52 +517,39 @@ function Build-Report {
     $targetNet = Convert-HumanNumber $Inputs.TargetNet
     $deductions = Convert-HumanNumber $Inputs.Deductions
 
-    $baseGross = 0.0
-    $bonus = 0.0
-    $totalComp = 0.0
-
+    # If the user provides a custom breakdown, use it.
+    # Otherwise, infer the full monthly payroll structure from the monthly gross.
+    $monthly = $null
     if ($customSalary) {
-        $baseGross = Round-Taka ($basic + $hra + $med + $food + $trans + $mobile)
-        $totalComp = Round-Taka $totalInput
-        if ($totalComp -le 0) { $totalComp = $baseGross }
-        if ($festivalPct -le 0) { $festivalPct = 100.0 }
+        $monthlyCore = Round-Taka ($customBasic + $customHRA + $customMedical + $customFood + $customTransport + $customMobile)
+        if ($monthlyGrossInput -le 0) { $monthlyGrossInput = $monthlyCore }
 
-        if ($bonusIncluded) {
-            if ($totalComp -lt $baseGross) {
-                $bonus = 0
-                $totalComp = $baseGross
-            } else {
-                $bonus = $totalComp - $baseGross
-            }
-        } else {
-            $monthlyBasic = $basic / 12.0
-            $bonus = Round-Taka ($monthlyBasic * ($festivalPct / 100.0))
-            $totalComp = $baseGross + $bonus
+        $monthly = [pscustomobject]@{
+            MonthlyGross   = $monthlyCore
+            GrossAllowance = $monthlyCore
+            Basic          = Round-Taka $customBasic
+            HRA            = Round-Taka $customHRA
+            Medical        = Round-Taka $customMedical
+            Food           = Round-Taka $customFood
+            Conveyance     = Round-Taka $customTransport
+            FestivalBonus  = 0.0
+            AnnualGross    = [math]::Round($monthlyCore * 12)
         }
     } else {
-        $est = Estimate-Allowances -BaseGross $totalInput
-        $basic = $est.Basic
-        $hra = $est.HRA
-        $med = $est.Medical
-        $trans = $est.Conveyance
-
-        if ($bonusIncluded) {
-            $totalComp = Round-Taka $totalInput
-            if ($totalComp -le 0) { $totalComp = 0 }
-            $baseGross = Round-Taka ($totalComp / (1 + [double]$Cfg.FestivalBonusRatio))
-            $bonus = $totalComp - $baseGross
-        } else {
-            $baseGross = Round-Taka $totalInput
-            $totalComp = $baseGross
-            if ($baseGross -gt 0) {
-                $bonus = Round-Taka ($baseGross * [double]$Cfg.FestivalBonusRatio)
-                $totalComp = $baseGross + $bonus
-            }
-        }
+        $monthly = New-MonthlyBreakdown -MonthlyGross $monthlyGrossInput
     }
 
-    $salaryExempt = [math]::Min($totalComp / 3.0, [double]$Cfg.SalaryExemptionCap)
-    $taxableSalary = [math]::Max(0, $totalComp - $salaryExempt)
+    $monthlyGross = [double]$monthly.MonthlyGross
+    $monthlyCoreAnnual = [math]::Round(([double]$monthly.GrossAllowance * 12))
+    $annualBonus = [math]::Round(([double]$monthly.Basic * ($festivalBonusRate / 100.0) * $festivalBonusCount))
+    $annualGross = [math]::Round($monthlyCoreAnnual + $annualBonus)
+    $annualHRA = [math]::Round(([double]$monthly.HRA * 12))
+    $annualMedical = [math]::Round(([double]$monthly.Medical * 12))
+    $annualFood = [math]::Round(([double]$monthly.Food * 12))
+    $annualConveyance = [math]::Round(([double]$monthly.Conveyance * 12))
+
+    $salaryExempt = [math]::Min($annualGross / 3.0, [double]$Cfg.SalaryExemptionCap)
+    $taxableSalary = [math]::Max(0, $annualGross - $salaryExempt)
 
     $taxCurrent = Calculate-Tax -Taxable $taxableSalary -Slabs $Cfg.TaxSlabs -MinimumTax ([double]$Cfg.MinimumTax)
     $rebate = Calculate-Rebate -Taxable $taxableSalary -Investment $investment -Cfg $Cfg -TaxBefore $taxCurrent.Tax
@@ -514,6 +569,7 @@ function Build-Report {
     $totalLiabilities = $bankLoan + $personalLoan + $creditCard + $otherLiabilities
     $netWealthUsed = $netWealthInput
     if ($totalAssets -gt 0) { $netWealthUsed = $totalAssets - $totalLiabilities }
+
     $surchargeRate = Determine-SurchargeRate -NetWealth $netWealthUsed -Apply $applySurcharge -Mode $surchargeMode -Cfg $Cfg
     $surchargeAmount = 0.0
     if ($surchargeRate -gt 0 -and $netWealthUsed -gt [double]$Cfg.SurchargeThreshold) {
@@ -532,34 +588,44 @@ function Build-Report {
     }
 
     $wealthIncrease = $netWealthUsed - $openingWealth
-    $expectedSavings = $totalComp - $deductions - $totalExpense - $finalTax
+    $expectedSavings = $annualGross - $deductions - $totalExpense - $finalTax
     $wealthDifference = $wealthIncrease - $expectedSavings
     $tol = [math]::Max(10000, [math]::Abs($expectedSavings) * 0.01)
 
     if ([math]::Abs($wealthDifference) -le $tol) {
-        $wealthStatus = 'OK — wealth increase matches estimated savings within tolerance.'
+        $wealthStatus = 'OK - wealth increase matches estimated savings within tolerance.'
         $auditRisk = 'LOW'
     } elseif ($wealthDifference -gt 0) {
-        $wealthStatus = 'ALERT — reported wealth is higher than estimated savings.'
+        $wealthStatus = 'ALERT - reported wealth is higher than estimated savings.'
         $auditRisk = 'HIGH'
     } else {
         $wealthStatus = 'Wealth increase is lower than estimated savings.'
         $auditRisk = 'MEDIUM'
     }
 
-    [pscustomobject]@{
+    return [pscustomobject]@{
         GeneratedAt = Get-Date
         TaxYear = $Cfg.TaxYear
 
-        SalaryInput = $totalInput
+        MonthlyGrossSalary = $monthlyGross
+        MonthlyGrossAllowance = [double]$monthly.GrossAllowance
+        MonthlyBasicSalary = [double]$monthly.Basic
+        MonthlyHouseRentAllowance = [double]$monthly.HRA
+        MonthlyMedicalAllowance = [double]$monthly.Medical
+        MonthlyFoodAllowance = [double]$monthly.Food
+        MonthlyConveyanceAllowance = [double]$monthly.Conveyance
+        MonthlyFestivalBonus = 0.0
+
+        SalaryInput = $monthlyCoreAnnual
         BonusIncluded = $bonusIncluded
         CustomSalary = $customSalary
-        BaseGrossSalary = $baseGross
-        HouseRentAllowance = $hra
-        MedicalAllowance = $med
-        ConveyanceAllowance = $trans
-        BonusAmount = $bonus
-        TotalComp = $totalComp
+        BaseGrossSalary = $monthlyCoreAnnual
+        HouseRentAllowance = $annualHRA
+        MedicalAllowance = $annualMedical
+        FoodAllowance = $annualFood
+        ConveyanceAllowance = $annualConveyance
+        BonusAmount = $annualBonus
+        TotalComp = $annualGross
         SalaryExempt = $salaryExempt
         TaxableSalary = $taxableSalary
 
@@ -589,7 +655,6 @@ function Build-Report {
         ExpectedSavings = $expectedSavings
         WealthDifference = $wealthDifference
         WealthStatus = $wealthStatus
-
         AuditRisk = $auditRisk
 
         ReverseEnabled = $reverseEnabled
@@ -603,57 +668,86 @@ function Build-Report {
 }
 
 function Get-ExpenseOrder {
-    Get-ExpenseKeys
+    return (Get-ExpenseKeys)
+}
+
+function Bar-ChartLine {
+    param(
+        [string]$Label,
+        [double]$Part,
+        [double]$Total,
+        [int]$Width = 26
+    )
+
+    if ($Total -le 0) {
+        return ($Label.PadRight(28) + ' | ')
+    }
+
+    $filled = [int][math]::Round(($Part / $Total) * $Width)
+    if ($filled -lt 0) { $filled = 0 }
+    if ($filled -gt $Width) { $filled = $Width }
+
+    $bar = ('#' * $filled).PadRight($Width, '.')
+    $percent = [math]::Round((($Part / $Total) * 100), 1)
+    $percentText = $percent.ToString('0.0').PadLeft(6)
+
+    return ($Label.PadRight(28) + ' | ' + $bar + ' | ' + $percentText + '%')
 }
 
 function Format-TaxTable {
     param($Lines)
     if (-not $Lines -or $Lines.Count -eq 0) { return "No taxable amount.`n" }
+
     $out = New-Object System.Text.StringBuilder
-    [void]$out.AppendLine(('SLAB'.PadRight(34) + ' | ' + 'TAXED'.PadRight(12) + ' | ' + 'RATE'.PadRight(8) + ' | ' + 'TAX'.PadRight(12)))
-    [void]$out.AppendLine((''.PadRight(78, '-')))
+
+    $header = 'SLAB'.PadRight(34) + ' | ' + 'TAXED'.PadRight(12) + ' | ' + 'RATE'.PadRight(8) + ' | ' + 'TAX'.PadRight(12)
+    [void]$out.AppendLine($header)
+    [void]$out.AppendLine(('-' * 78))
+
     foreach ($ln in $Lines) {
-        [void]$out.AppendLine((
-            $ln.Label.PadRight(34) + ' | ' +
-            (Format-Money $ln.Amount).PadLeft(12) + ' | ' +
-            ('{0:0}%' -f ($ln.Rate * 100)).PadLeft(7) + ' | ' +
-            (Format-Money $ln.Tax).PadLeft(12)
-        ))
+        $rateText = ($ln.Rate * 100).ToString('0') + '%'
+        $line = $ln.Label.PadRight(34) + ' | ' + (Format-Money $ln.Amount).PadLeft(12) + ' | ' + $rateText.PadLeft(8) + ' | ' + (Format-Money $ln.Tax).PadLeft(12)
+        [void]$out.AppendLine($line)
     }
-    [void]$out.AppendLine((''.PadRight(78, '-')))
+
+    [void]$out.AppendLine(('-' * 78))
     return $out.ToString()
 }
 
 function Format-KvLine {
     param([string]$Label, [double]$Value)
-    '{0,-34} Tk {1}' -f $Label, (Format-Money $Value)
+    return [string]::Format('{0,-34} Tk {1}', $Label, (Format-Money $Value))
 }
 
-function New-ReportText {
+function New-TextReport {
     param($R)
 
     $sb = New-Object System.Text.StringBuilder
 
-    [void]$sb.AppendLine('SUMMARY')
-    [void]$sb.AppendLine(('Assessment year'.PadRight(34) + ' ' + $R.TaxYear))
-    [void]$sb.AppendLine(('Generated'.PadRight(34) + ' ' + $R.GeneratedAt.ToString('yyyy-MM-dd HH:mm:ss')))
+    [void]$sb.AppendLine('================================================================================')
+    [void]$sb.AppendLine(" $($script:AppName)  $($script:AppVersion)")
+    [void]$sb.AppendLine(" Author: $($script:AppAuthor)")
+    [void]$sb.AppendLine(" Repo  : $($script:AppRepo)")
+    [void]$sb.AppendLine('================================================================================')
     [void]$sb.AppendLine()
 
-    [void]$sb.AppendLine('SALARY / INCOME')
+    [void]$sb.AppendLine('SALARY / INCOME (MONTHLY)')
+    [void]$sb.AppendLine((Format-KvLine 'Monthly gross salary' $R.MonthlyGrossSalary))
+    [void]$sb.AppendLine((Format-KvLine 'Gross allowance' $R.MonthlyGrossAllowance))
+    [void]$sb.AppendLine((Format-KvLine 'Basic salary' $R.MonthlyBasicSalary))
+    [void]$sb.AppendLine((Format-KvLine 'House rent allowance' $R.MonthlyHouseRentAllowance))
+    [void]$sb.AppendLine((Format-KvLine 'Medical allowance' $R.MonthlyMedicalAllowance))
+    [void]$sb.AppendLine((Format-KvLine 'Food allowance' $R.MonthlyFoodAllowance))
+    [void]$sb.AppendLine((Format-KvLine 'Conveyance allowance' $R.MonthlyConveyanceAllowance))
+
+    [void]$sb.AppendLine('SALARY / INCOME (ANNUALIZED)')
     [void]$sb.AppendLine((Format-KvLine 'Annual salary input' $R.SalaryInput))
-    [void]$sb.AppendLine((Format-KvLine 'House rent allowance' $R.HouseRentAllowance))
-    [void]$sb.AppendLine((Format-KvLine 'Medical allowance' $R.MedicalAllowance))
-    [void]$sb.AppendLine((Format-KvLine 'Conveyance allowance' $R.ConveyanceAllowance))
-    if (-not $R.CustomSalary) {
-        [void]$sb.AppendLine('Allowance note: estimated split from the gross salary because custom breakdown is off.')
-    }
-    if ($R.CustomSalary) {
-        [void]$sb.AppendLine((Format-KvLine 'Basic gross salary' $R.BaseGrossSalary))
-        [void]$sb.AppendLine((Format-KvLine 'Festival bonus (one-month %)' $R.BonusAmount))
-    } else {
-        [void]$sb.AppendLine((Format-KvLine 'Base gross salary' $R.BaseGrossSalary))
-        [void]$sb.AppendLine((Format-KvLine 'Festival bonus' $R.BonusAmount))
-    }
+    [void]$sb.AppendLine((Format-KvLine 'Annual basic salary' $R.BaseGrossSalary))
+    [void]$sb.AppendLine((Format-KvLine 'Annual house rent allowance' $R.HouseRentAllowance))
+    [void]$sb.AppendLine((Format-KvLine 'Annual medical allowance' $R.MedicalAllowance))
+    [void]$sb.AppendLine((Format-KvLine 'Annual food allowance' $R.FoodAllowance))
+    [void]$sb.AppendLine((Format-KvLine 'Annual conveyance allowance' $R.ConveyanceAllowance))
+    [void]$sb.AppendLine((Format-KvLine 'Annual festival bonus' $R.BonusAmount))
     [void]$sb.AppendLine((Format-KvLine 'Total compensation' $R.TotalComp))
     [void]$sb.AppendLine((Format-KvLine 'Salary exemption' $R.SalaryExempt))
     [void]$sb.AppendLine((Format-KvLine 'Taxable income' $R.TaxableSalary))
@@ -677,8 +771,9 @@ function New-ReportText {
 
     if ($R.ApplySurcharge) {
         [void]$sb.AppendLine('NET WEALTH SURCHARGE')
-        [void]$sb.AppendLine(('Applied'.PadRight(34) + ' ' + ($(if ($R.SurchargeRate -gt 0) { 'Yes' } else { 'No' }))))
-        [void]$sb.AppendLine(('Surcharge rate'.PadRight(34) + ' ' + ('{0:N2}%' -f ($R.SurchargeRate * 100))))
+        $applied = if ($R.SurchargeRate -gt 0) { 'Yes' } else { 'No' }
+        [void]$sb.AppendLine(('{0,-34} {1}' -f 'Applied', $applied))
+        [void]$sb.AppendLine(('{0,-34} {1}' -f 'Surcharge rate', ('{0:N2}%' -f ($R.SurchargeRate * 100))))
         [void]$sb.AppendLine((Format-KvLine 'Surcharge amount' $R.SurchargeAmount))
         [void]$sb.AppendLine((Format-KvLine 'Combined tax before surcharge' $R.CombinedBeforeSurch))
         [void]$sb.AppendLine((Format-KvLine 'Final tax' $R.FinalTax))
@@ -703,7 +798,7 @@ function New-ReportText {
     [void]$sb.AppendLine((Format-KvLine 'Total assets (provided)' $R.TotalAssets))
     [void]$sb.AppendLine((Format-KvLine 'Total liabilities' $R.TotalLiabilities))
     [void]$sb.AppendLine((Format-KvLine 'Net wealth (used)' $R.NetWealthCurrent))
-    [void]$sb.AppendLine(('Audit risk'.PadRight(34) + ' ' + $R.AuditRisk))
+    [void]$sb.AppendLine(('{0,-34} {1}' -f 'Audit risk', $R.AuditRisk))
     [void]$sb.AppendLine()
 
     [void]$sb.AppendLine('WEALTH CHECK')
@@ -721,16 +816,41 @@ function New-ReportText {
         [void]$sb.AppendLine()
     }
 
+    [void]$sb.AppendLine('VISUAL SUMMARY')
+    [void]$sb.AppendLine((Bar-ChartLine -Label 'Tax before rebate' -Part $R.CurrentTaxBeforeRebate -Total ([math]::Max(1, $R.CurrentTaxBeforeRebate + $R.SurchargeAmount)) -Width 36))
+    if ($R.SurchargeAmount -gt 0) {
+        [void]$sb.AppendLine((Bar-ChartLine -Label 'Surcharge' -Part $R.SurchargeAmount -Total ([math]::Max(1, $R.CurrentTaxBeforeRebate + $R.SurchargeAmount)) -Width 36))
+    }
+    if ($R.TotalExpense -gt 0) {
+        [void]$sb.AppendLine()
+        foreach ($k in (Get-ExpenseOrder)) {
+            if ($R.ExpenseAmts[$k] -gt 0) {
+                [void]$sb.AppendLine((Bar-ChartLine -Label $k -Part ([double]$R.ExpenseAmts[$k]) -Total $R.TotalExpense -Width 36))
+            }
+        }
+    }
+    [void]$sb.AppendLine()
+
+    [void]$sb.AppendLine('TIP: use export commands for JSON, CSV, Markdown, or PDF.')
     return $sb.ToString()
 }
 
 function Save-Session {
-    param($Path, $Inputs)
+    param(
+        [string]$Path,
+        $Inputs,
+        [int]$Step = 0,
+        [int]$Section = 0
+    )
+
     $session = [pscustomobject]@{
-        Version = 1
+        Version   = 1
         Timestamp = (Get-Date).ToString('o')
-        Inputs = $Inputs
+        Inputs    = $Inputs
+        Step      = $Step
+        Section   = $Section
     }
+
     $raw = $session | ConvertTo-Json -Depth 12
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
@@ -738,7 +858,7 @@ function Save-Session {
         $hashBytes = $sha.ComputeHash($bytes)
         $hash = ([BitConverter]::ToString($hashBytes) -replace '-', '').ToLowerInvariant()
         $wrapped = [pscustomobject]@{
-            Hash = $hash
+            Hash    = $hash
             Session = $session
         }
         $wrapped | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Path -Encoding UTF8
@@ -748,9 +868,11 @@ function Save-Session {
 }
 
 function Load-Session {
-    param($Path)
+    param([string]$Path)
+
     $wrapped = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
     $raw = $wrapped.Session | ConvertTo-Json -Depth 12
+
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
@@ -759,20 +881,29 @@ function Load-Session {
         if ($hash -ne $wrapped.Hash) {
             throw 'SHA256 mismatch: file may be corrupted or tampered with.'
         }
-        return $wrapped.Session.Inputs
+        return $wrapped.Session
     } finally {
         $sha.Dispose()
     }
 }
 
 function Export-CSVReport {
-    param($Path, $R)
+    param([string]$Path, $R)
+
     $rows = @(
         [pscustomobject]@{ Field='Tax year'; Value=$R.TaxYear }
+        [pscustomobject]@{ Field='Monthly gross salary'; Value=(Format-Money $R.MonthlyGrossSalary) }
+        [pscustomobject]@{ Field='Monthly gross allowance'; Value=(Format-Money $R.MonthlyGrossAllowance) }
+        [pscustomobject]@{ Field='Monthly basic salary'; Value=(Format-Money $R.MonthlyBasicSalary) }
+        [pscustomobject]@{ Field='Monthly house rent allowance'; Value=(Format-Money $R.MonthlyHouseRentAllowance) }
+        [pscustomobject]@{ Field='Monthly medical allowance'; Value=(Format-Money $R.MonthlyMedicalAllowance) }
+        [pscustomobject]@{ Field='Monthly food allowance'; Value=(Format-Money $R.MonthlyFoodAllowance) }
+        [pscustomobject]@{ Field='Monthly conveyance allowance'; Value=(Format-Money $R.MonthlyConveyanceAllowance) }
         [pscustomobject]@{ Field='Annual salary input'; Value=(Format-Money $R.SalaryInput) }
         [pscustomobject]@{ Field='Base gross salary'; Value=(Format-Money $R.BaseGrossSalary) }
         [pscustomobject]@{ Field='House rent allowance'; Value=(Format-Money $R.HouseRentAllowance) }
         [pscustomobject]@{ Field='Medical allowance'; Value=(Format-Money $R.MedicalAllowance) }
+        [pscustomobject]@{ Field='Food allowance'; Value=(Format-Money $R.FoodAllowance) }
         [pscustomobject]@{ Field='Conveyance allowance'; Value=(Format-Money $R.ConveyanceAllowance) }
         [pscustomobject]@{ Field='Festival bonus'; Value=(Format-Money $R.BonusAmount) }
         [pscustomobject]@{ Field='Total compensation'; Value=(Format-Money $R.TotalComp) }
@@ -794,19 +925,41 @@ function Export-CSVReport {
         [pscustomobject]@{ Field='Wealth status'; Value=$R.WealthStatus }
         [pscustomobject]@{ Field='Audit risk'; Value=$R.AuditRisk }
     )
+
     $rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
 }
 
 function Export-MarkdownReport {
-    param($Path, $R)
+    param([string]$Path, $R)
 
     $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine('# Tax Companion Report')
+    [void]$sb.AppendLine('# IT-10BB Tax Companion Report')
     [void]$sb.AppendLine()
+    [void]$sb.AppendLine("* Author: $($script:AppAuthor)")
+    [void]$sb.AppendLine("* Version: $($script:AppVersion)")
+    [void]$sb.AppendLine("* Repo: $($script:AppRepo)")
     [void]$sb.AppendLine("* Tax year: $($R.TaxYear)")
     [void]$sb.AppendLine("* Generated: $($R.GeneratedAt.ToString('o'))")
     [void]$sb.AppendLine()
-    [void]$sb.AppendLine('## Summary')
+
+    [void]$sb.AppendLine('## Monthly salary breakdown')
+    [void]$sb.AppendLine()
+    [void]$sb.AppendLine('| Field | Value |')
+    [void]$sb.AppendLine('|---|---:|')
+    foreach ($pair in @(
+        @('Monthly gross salary', $R.MonthlyGrossSalary)
+        @('Monthly gross allowance', $R.MonthlyGrossAllowance)
+        @('Monthly basic salary', $R.MonthlyBasicSalary)
+        @('Monthly house rent allowance', $R.MonthlyHouseRentAllowance)
+        @('Monthly medical allowance', $R.MonthlyMedicalAllowance)
+        @('Monthly food allowance', $R.MonthlyFoodAllowance)
+        @('Monthly conveyance allowance', $R.MonthlyConveyanceAllowance)
+    )) {
+        [void]$sb.AppendLine("| $($pair[0]) | Tk $(Format-Money $pair[1]) |")
+    }
+
+    [void]$sb.AppendLine()
+    [void]$sb.AppendLine('## Annualized salary / tax summary')
     [void]$sb.AppendLine()
     [void]$sb.AppendLine('| Field | Value |')
     [void]$sb.AppendLine('|---|---:|')
@@ -815,6 +968,7 @@ function Export-MarkdownReport {
         @('Base gross salary', $R.BaseGrossSalary)
         @('House rent allowance', $R.HouseRentAllowance)
         @('Medical allowance', $R.MedicalAllowance)
+        @('Food allowance', $R.FoodAllowance)
         @('Conveyance allowance', $R.ConveyanceAllowance)
         @('Festival bonus', $R.BonusAmount)
         @('Total compensation', $R.TotalComp)
@@ -836,10 +990,11 @@ function Export-MarkdownReport {
         @('Wealth status', $R.WealthStatus)
         @('Audit risk', $R.AuditRisk)
     )) {
-        [void]$sb.AppendLine("| $($pair[0]) | $([string]$pair[1]) |")
+        [void]$sb.AppendLine("| $($pair[0]) | Tk $([string]$(if ($pair[0] -eq 'Wealth status' -or $pair[0] -eq 'Audit risk') { $pair[1] } else { (Format-Money $pair[1]) })) |")
     }
-    [void]$sb.AppendLine()
+
     if ($R.TotalExpense -gt 0) {
+        [void]$sb.AppendLine()
         [void]$sb.AppendLine('## Expense allocation')
         [void]$sb.AppendLine()
         [void]$sb.AppendLine('| Category | % | Amount |')
@@ -848,30 +1003,143 @@ function Export-MarkdownReport {
             if ($R.ExpensePcts[$k] -eq 0 -and $R.ExpenseAmts[$k] -eq 0) { continue }
             [void]$sb.AppendLine("| $k | $($R.ExpensePcts[$k]) | Tk $(Format-Money $R.ExpenseAmts[$k]) |")
         }
+    }
+
+    if ($R.ReverseEnabled -and $R.TargetNetTakeHome -gt 0) {
         [void]$sb.AppendLine()
+        [void]$sb.AppendLine('## Reverse calculator')
+        [void]$sb.AppendLine()
+        [void]$sb.AppendLine("* Target net take-home: Tk $(Format-Money $R.TargetNetTakeHome)")
+        [void]$sb.AppendLine("* Extra deductions: Tk $(Format-Money $R.Deductions)")
+        [void]$sb.AppendLine("* Estimated gross salary: Tk $(Format-Money $R.EstimatedGrossFromNet)")
     }
 
     [IO.File]::WriteAllText($Path, $sb.ToString(), [System.Text.Encoding]::UTF8)
 }
 
-function Show-Header {
+function Escape-PdfText {
+    param([string]$Text)
+    $s = $Text
+    if ($null -eq $s) { $s = '' }
+    $s = $s -replace '\\', '\\\\'
+    $s = $s -replace '\(', '\('
+    $s = $s -replace '\)', '\)'
+    return $s
+}
+
+function Export-PdfReport {
+    param([string]$Path, $R)
+
+    $text = New-TextReport $R
+    $lines = $text -split "`r?`n"
+
+    $pageWidth = 595.0
+    $pageHeight = 842.0
+    $marginX = 40.0
+    $marginTop = 40.0
+    $fontSize = 9.0
+    $lineHeight = 11.0
+    $maxLinesPerPage = [int][math]::Floor(($pageHeight - (2 * $marginTop)) / $lineHeight)
+    if ($maxLinesPerPage -lt 1) { $maxLinesPerPage = 1 }
+
+    $pages = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $lines.Count; $i += $maxLinesPerPage) {
+        $end = [math]::Min($i + $maxLinesPerPage, $lines.Count)
+        $pages.Add($lines[$i..($end - 1)])
+    }
+
+    $objects = New-Object System.Collections.Generic.List[string]
+    $objects.Add('') # 1 Catalog placeholder
+    $objects.Add('') # 2 Pages placeholder
+    $objects.Add('<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>') # 3 font
+
+    $pageObjectNumbers = New-Object System.Collections.Generic.List[int]
+    $contentObjectNumbers = New-Object System.Collections.Generic.List[int]
+
+    for ($p = 0; $p -lt $pages.Count; $p++) {
+        $pageObjectNumbers.Add($objects.Count + 1)
+        $objects.Add('') # page placeholder
+        $contentObjectNumbers.Add($objects.Count + 1)
+        $objects.Add('') # content placeholder
+    }
+
+    $kidsRefs = ($pageObjectNumbers | ForEach-Object { "$_ 0 R" }) -join ' '
+
+    # Fill page and content objects
+    for ($p = 0; $p -lt $pages.Count; $p++) {
+        $pageNum = $pageObjectNumbers[$p]
+        $contentNum = $contentObjectNumbers[$p]
+        $pageObj = " << /Type /Page /Parent 2 0 R /MediaBox [0 0 $pageWidth $pageHeight] /Resources << /Font << /F1 3 0 R >> >> /Contents $contentNum 0 R >>"
+        $objects[$pageNum - 1] = $pageObj
+
+        $contentLines = New-Object System.Collections.Generic.List[string]
+        $contentLines.Add('BT')
+        $contentLines.Add("/F1 $fontSize Tf")
+        $contentLines.Add("1 0 0 1 $marginX " + ($pageHeight - $marginTop) + " Tm")
+
+        foreach ($line in $pages[$p]) {
+            $escaped = Escape-PdfText $line
+            $contentLines.Add("($escaped) Tj")
+            $contentLines.Add("0 -$lineHeight Td")
+        }
+        $contentLines.Add('ET')
+        $contentStream = ($contentLines -join "`n")
+        $objects[$contentNum - 1] = "<< /Length $([Text.Encoding]::ASCII.GetByteCount($contentStream)) >>`nstream`n$contentStream`nendstream"
+    }
+
+    $objects[0] = "<< /Type /Catalog /Pages 2 0 R >>"
+    $objects[1] = "<< /Type /Pages /Kids [$kidsRefs] /Count $($pages.Count) >>"
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('%PDF-1.4')
+    $offsets = New-Object System.Collections.Generic.List[int]
+    $offsets.Add(0)
+
+    for ($i = 0; $i -lt $objects.Count; $i++) {
+        $offsets.Add([Text.Encoding]::ASCII.GetByteCount($sb.ToString()))
+        [void]$sb.AppendLine("$($i + 1) 0 obj")
+        [void]$sb.AppendLine($objects[$i])
+        [void]$sb.AppendLine('endobj')
+    }
+
+    $xrefStart = [Text.Encoding]::ASCII.GetByteCount($sb.ToString())
+    [void]$sb.AppendLine('xref')
+    [void]$sb.AppendLine("0 $($objects.Count + 1)")
+    [void]$sb.AppendLine('0000000000 65535 f ')
+    for ($i = 1; $i -le $objects.Count; $i++) {
+        [void]$sb.AppendLine(('{0:0000000000} 00000 n ' -f $offsets[$i]))
+    }
+    [void]$sb.AppendLine('trailer')
+    [void]$sb.AppendLine("<< /Size $($objects.Count + 1) /Root 1 0 R >>")
+    [void]$sb.AppendLine('startxref')
+    [void]$sb.AppendLine($xrefStart)
+    [void]$sb.AppendLine('%%EOF')
+
+    [IO.File]::WriteAllText($Path, $sb.ToString(), [System.Text.Encoding]::ASCII)
+}
+
+function Write-Banner {
     Clear-Host
-    Write-Host "============================================================" -ForegroundColor Green
-    Write-Host $AppName -ForegroundColor White
-    Write-Host "$AppAuthor • $AppGitHub • $Version" -ForegroundColor DarkGray
-    Write-Host "============================================================" -ForegroundColor Green
+    Write-Host '+==============================================================================+' -ForegroundColor Cyan
+    Write-Host ("|  {0,-74}|" -f $script:AppName) -ForegroundColor Cyan
+    Write-Host ("|  {0,-74}|" -f "$($script:AppVersion)  |  Author: $($script:AppAuthor)") -ForegroundColor Green
+    Write-Host ("|  {0,-74}|" -f "Repo: $($script:AppRepo)") -ForegroundColor DarkCyan
+    Write-Host '+==============================================================================+' -ForegroundColor Cyan
     Write-Host
 }
 
 function Read-Field {
-    param([string]$Prompt, [string]$Default)
-    $v = Read-Host "$Prompt [$Default]"
-    if ([string]::IsNullOrWhiteSpace($v)) { return $Default }
-    return $v
+    param(
+        [string]$Prompt,
+        [string]$Default
+    )
+
+    $value = Read-Host ("{0} [{1}]" -f $Prompt, $Default)
+    if ([string]::IsNullOrWhiteSpace($value)) { return $Default }
+    return $value
 }
 
-function Run-App {
-    $cfg = Get-Config
+function Prompt-Inputs {
     $inputs = [ordered]@{
         TotalSalary      = ''
         BonusIncluded    = 'n'
@@ -882,7 +1150,7 @@ function Run-App {
         Food             = '0'
         Transport        = '0'
         Mobile           = '0'
-        FestivalPct      = '100'
+        EmployeeType     = 'staff'
         TotalExpense     = '0'
         Location         = 'other'
         FamilySize       = '3'
@@ -906,32 +1174,33 @@ function Run-App {
         Deductions       = '0'
     }
 
-    Show-Header
-    Write-Host "Enter values. Expressions like 12809*23, 1 lakh, 2cr, 4.5k, and 50% are accepted." -ForegroundColor DarkCyan
+    Write-Banner
+    Write-Host 'Use expressions like 12809*23, 1 lakh, 2cr, 4.5k, and 50%.' -ForegroundColor Yellow
+    Write-Host 'Press Enter to accept the default in brackets.' -ForegroundColor DarkGray
     Write-Host
 
-    $inputs.TotalSalary      = Read-Field '1. Annual Salary / Total Package (BDT)' $inputs.TotalSalary
-    $inputs.BonusIncluded    = Read-Field '2. Festival bonus already included? (y/n)' $inputs.BonusIncluded
-    $inputs.CustomSalary     = Read-Field '3. Enter custom salary breakdown? (y/n)' $inputs.CustomSalary
+    $inputs.TotalSalary   = Read-Field '1. Monthly gross salary (BDT)' $inputs.TotalSalary
+    $inputs.BonusIncluded = Read-Field '2. Festival bonus already included? (y/n)' $inputs.BonusIncluded
+    $inputs.CustomSalary  = Read-Field '3. Enter custom salary breakdown? (y/n)' $inputs.CustomSalary
+    $inputs.EmployeeType  = Read-Field '4. Employee type (staff/worker)' $inputs.EmployeeType
 
     if (Test-Bool $inputs.CustomSalary $false) {
-        $inputs.Basic        = Read-Field '   -> Basic pay (annual BDT)' $inputs.Basic
-        $inputs.HRA          = Read-Field '   -> House rent allowance (annual BDT)' $inputs.HRA
-        $inputs.Medical      = Read-Field '   -> Medical allowance (annual BDT)' $inputs.Medical
-        $inputs.Food         = Read-Field '   -> Food allowance (annual BDT)' $inputs.Food
-        $inputs.Transport    = Read-Field '   -> Transport / conveyance (annual BDT)' $inputs.Transport
-        $inputs.Mobile       = Read-Field '   -> Mobile & other allowance (annual BDT)' $inputs.Mobile
-        $inputs.FestivalPct  = Read-Field '   -> Festival bonus % of ONE MONTH BASIC' $inputs.FestivalPct
+        $inputs.Basic       = Read-Field '   -> Basic salary (monthly BDT)' $inputs.Basic
+        $inputs.HRA         = Read-Field '   -> House rent allowance (monthly BDT)' $inputs.HRA
+        $inputs.Medical     = Read-Field '   -> Medical allowance (monthly BDT)' $inputs.Medical
+        $inputs.Food        = Read-Field '   -> Food allowance (monthly BDT)' $inputs.Food
+        $inputs.Transport   = Read-Field '   -> Conveyance allowance (monthly BDT)' $inputs.Transport
+        $inputs.Mobile      = Read-Field '   -> Mobile & other allowance (monthly BDT)' $inputs.Mobile
     }
 
-    $inputs.TotalExpense     = Read-Field '4. Total annual expense (BDT)' $inputs.TotalExpense
-    $inputs.Location         = Read-Field '5. Location (dhaka/other)' $inputs.Location
-    $inputs.FamilySize       = Read-Field '6. Family size' $inputs.FamilySize
-    $inputs.HasKids          = Read-Field '7. Do you have kids? (y/n)' $inputs.HasKids
-    $inputs.OwnHome          = Read-Field '8. Do you own your home? (y/n)' $inputs.OwnHome
-    $inputs.HasStaff         = Read-Field '9. Home-support staff? (y/n)' $inputs.HasStaff
-    $inputs.Mode             = Read-Field '10. Mode (balanced/conservative/comfortable)' $inputs.Mode
-    $inputs.PreviousGross    = Read-Field "11. Previous year's gross income (BDT)" $inputs.PreviousGross
+    $inputs.TotalExpense     = Read-Field '5. Total annual expense (BDT)' $inputs.TotalExpense
+    $inputs.Location         = Read-Field '6. Location (dhaka/other)' $inputs.Location
+    $inputs.FamilySize       = Read-Field '7. Family size' $inputs.FamilySize
+    $inputs.HasKids          = Read-Field '8. Do you have kids? (y/n)' $inputs.HasKids
+    $inputs.OwnHome          = Read-Field '9. Do you own your home? (y/n)' $inputs.OwnHome
+    $inputs.HasStaff         = Read-Field '10. Home-support staff? (y/n)' $inputs.HasStaff
+    $inputs.Mode             = Read-Field '11. Mode (balanced/conservative/comfortable)' $inputs.Mode
+    $inputs.PreviousGross    = Read-Field "12. Previous year's gross income (annual BDT)" $inputs.PreviousGross
     $inputs.NetWealth        = Read-Field '12. Net wealth (current) (BDT) (fallback)' $inputs.NetWealth
     $inputs.OpeningNetWealth = Read-Field '13. Opening net wealth (previous year) (BDT)' $inputs.OpeningNetWealth
     $inputs.TotalAssets      = Read-Field '14. Total assets (BDT) (overrides net wealth if set)' $inputs.TotalAssets
@@ -946,68 +1215,179 @@ function Run-App {
     $inputs.TargetNet        = Read-Field '23. Target net take-home pay (BDT)' $inputs.TargetNet
     $inputs.Deductions       = Read-Field '24. Extra deductions / PF / other (BDT)' $inputs.Deductions
 
-    $report = Build-Report -Inputs $inputs -Cfg $cfg
-    $reportText = New-ReportText $report
+    return $inputs
+}
 
-    Show-Header
-    Write-Host $reportText
+function Show-Report {
+    param($R)
 
-    while ($true) {
+    Write-Banner
+
+    Write-Host 'MONTHLY SALARY BREAKDOWN' -ForegroundColor Magenta
+    Write-Host ('{0,-34} Tk {1}' -f 'Monthly gross salary', (Format-Money $R.MonthlyGrossSalary)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Gross allowance', (Format-Money $R.MonthlyGrossAllowance)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Basic salary', (Format-Money $R.MonthlyBasicSalary)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'House rent allowance', (Format-Money $R.MonthlyHouseRentAllowance)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Medical allowance', (Format-Money $R.MonthlyMedicalAllowance)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Food allowance', (Format-Money $R.MonthlyFoodAllowance)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Conveyance allowance', (Format-Money $R.MonthlyConveyanceAllowance)) -ForegroundColor White
+    Write-Host
+
+    Write-Host 'ANNUALIZED SALARY / TAX' -ForegroundColor Cyan
+    Write-Host ('{0,-34} Tk {1}' -f 'Annual salary input', (Format-Money $R.SalaryInput)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Base gross salary', (Format-Money $R.BaseGrossSalary)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'House rent allowance', (Format-Money $R.HouseRentAllowance)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Medical allowance', (Format-Money $R.MedicalAllowance)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Food allowance', (Format-Money $R.FoodAllowance)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Conveyance allowance', (Format-Money $R.ConveyanceAllowance)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Festival bonus', (Format-Money $R.BonusAmount)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Total compensation', (Format-Money $R.TotalComp)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Salary exemption', (Format-Money $R.SalaryExempt)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Taxable income', (Format-Money $R.TaxableSalary)) -ForegroundColor White
+    Write-Host
+
+    Write-Host 'CURRENT YEAR TAX' -ForegroundColor Yellow
+    Write-Host (Format-TaxTable $R.CurrentTaxLines)
+    Write-Host ('{0,-34} Tk {1}' -f 'Tax before rebate', (Format-Money $R.CurrentTaxBeforeRebate)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Eligible investment', (Format-Money $R.RebateEligibleInvest)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Tax rebate (Section 44)', (Format-Money $R.RebateAmount)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Tax after rebate', (Format-Money $R.CurrentTaxAfterRebate)) -ForegroundColor White
+    Write-Host
+
+    if ($R.PreviousGrossInput -gt 0) {
+        Write-Host 'PREVIOUS YEAR TAX' -ForegroundColor DarkYellow
+        Write-Host ('{0,-34} Tk {1}' -f 'Previous gross income', (Format-Money $R.PreviousGrossInput)) -ForegroundColor White
+        Write-Host (Format-TaxTable $R.PrevTaxLines)
+        Write-Host ('{0,-34} Tk {1}' -f 'Previous year tax', (Format-Money $R.PreviousTax)) -ForegroundColor White
         Write-Host
-        Write-Host "Commands: [s]ave JSON  [l]oad JSON  [c]sv  [m]d  [r]e-run  [q]uit" -ForegroundColor DarkGray
-        $cmd = (Read-Host 'Enter command').Trim().ToLowerInvariant()
+    }
 
-        switch ($cmd) {
-            's' {
-                $path = Read-Host 'Session JSON path' 
-                if ([string]::IsNullOrWhiteSpace($path)) { $path = 'tax_session.json' }
-                if (-not $path.EndsWith('.json')) { $path += '.json' }
-                Save-Session -Path $path -Inputs $inputs
-                Write-Host "Saved: $path" -ForegroundColor Green
+    if ($R.ApplySurcharge) {
+        Write-Host 'NET WEALTH SURCHARGE' -ForegroundColor Red
+        Write-Host ('{0,-34} {1}' -f 'Applied', ($(if ($R.SurchargeRate -gt 0) { 'Yes' } else { 'No' }))) -ForegroundColor White
+        Write-Host ('{0,-34} {1}' -f 'Surcharge rate', ('{0:N2}%' -f ($R.SurchargeRate * 100))) -ForegroundColor White
+        Write-Host ('{0,-34} Tk {1}' -f 'Surcharge amount', (Format-Money $R.SurchargeAmount)) -ForegroundColor White
+        Write-Host ('{0,-34} Tk {1}' -f 'Combined tax before surcharge', (Format-Money $R.CombinedBeforeSurch)) -ForegroundColor White
+        Write-Host ('{0,-34} Tk {1}' -f 'Final tax', (Format-Money $R.FinalTax)) -ForegroundColor White
+        Write-Host
+    } else {
+        Write-Host 'FINAL TAX' -ForegroundColor Green
+        Write-Host ('{0,-34} Tk {1}' -f 'Final tax', (Format-Money $R.FinalTax)) -ForegroundColor White
+        Write-Host
+    }
+
+    if ($R.TotalExpense -gt 0) {
+        Write-Host 'IT-10BB EXPENSE ALLOCATION' -ForegroundColor Magenta
+        foreach ($k in (Get-ExpenseOrder)) {
+            if ($R.ExpensePcts[$k] -eq 0 -and $R.ExpenseAmts[$k] -eq 0) { continue }
+            Write-Host ('{0,-34} {1,3}%   Tk {2}' -f $k, $R.ExpensePcts[$k], (Format-Money $R.ExpenseAmts[$k])) -ForegroundColor White
+        }
+        Write-Host ('{0,-34} {1,3}%   Tk {2}' -f 'TOTAL', 100, (Format-Money ([int](Round-Taka $R.TotalExpense)))) -ForegroundColor White
+        Write-Host
+    }
+
+    Write-Host 'WEALTH SUMMARY' -ForegroundColor Cyan
+    Write-Host ('{0,-34} Tk {1}' -f 'Total assets (provided)', (Format-Money $R.TotalAssets)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Total liabilities', (Format-Money $R.TotalLiabilities)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Net wealth (used)', (Format-Money $R.NetWealthCurrent)) -ForegroundColor White
+    Write-Host ('{0,-34} {1}' -f 'Audit risk', $R.AuditRisk) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Opening net wealth', (Format-Money $R.OpeningNetWealth)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Wealth increase', (Format-Money $R.WealthIncrease)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Estimated after-tax savings', (Format-Money $R.ExpectedSavings)) -ForegroundColor White
+    Write-Host $R.WealthStatus -ForegroundColor Yellow
+    Write-Host
+
+    if ($R.ReverseEnabled -and $R.TargetNetTakeHome -gt 0) {
+        Write-Host 'REVERSE CALCULATOR' -ForegroundColor DarkCyan
+        Write-Host ('{0,-34} Tk {1}' -f 'Target net take-home', (Format-Money $R.TargetNetTakeHome)) -ForegroundColor White
+        Write-Host ('{0,-34} Tk {1}' -f 'Extra deductions', (Format-Money $R.Deductions)) -ForegroundColor White
+        Write-Host ('{0,-34} Tk {1}' -f 'Estimated gross salary', (Format-Money $R.EstimatedGrossFromNet)) -ForegroundColor White
+        Write-Host
+    }
+
+    Write-Host 'VISUAL SUMMARY' -ForegroundColor Green
+    Write-Host (Bar-ChartLine -Label 'Tax before rebate' -Part $R.CurrentTaxBeforeRebate -Total ([math]::Max(1, $R.CurrentTaxBeforeRebate + $R.SurchargeAmount)) -Width 36) -ForegroundColor White
+    if ($R.SurchargeAmount -gt 0) {
+        Write-Host (Bar-ChartLine -Label 'Surcharge' -Part $R.SurchargeAmount -Total ([math]::Max(1, $R.CurrentTaxBeforeRebate + $R.SurchargeAmount)) -Width 36) -ForegroundColor White
+    }
+    if ($R.TotalExpense -gt 0) {
+        foreach ($k in (Get-ExpenseOrder)) {
+            if ($R.ExpenseAmts[$k] -gt 0) {
+                Write-Host (Bar-ChartLine -Label $k -Part ([double]$R.ExpenseAmts[$k]) -Total $R.TotalExpense -Width 36) -ForegroundColor White
             }
-            'l' {
-                $path = Read-Host 'Session JSON path'
-                if ([string]::IsNullOrWhiteSpace($path)) { $path = 'tax_session.json' }
-                if (-not $path.EndsWith('.json')) { $path += '.json' }
-                $loaded = Load-Session -Path $path
-                $idx = 0
-                foreach ($k in $inputs.Keys) {
-                    if ($idx -lt $loaded.Count) { $inputs[$k] = [string]$loaded[$idx] }
-                    $idx++
+        }
+    }
+
+    Write-Host
+    Write-Host 'Commands: [s]ave JSON  [l]oad JSON  [c]sv  [m]d  [p]df  [r]e-run  [q]uit' -ForegroundColor DarkGray
+}
+
+function Invoke-App {
+    $cfg = Load-Config
+    while ($true) {
+        $inputs = Prompt-Inputs
+        $report = Build-Report -Inputs $inputs -Cfg $cfg
+        Show-Report $report
+
+        while ($true) {
+            $cmd = (Read-Host 'Enter command').Trim().ToLowerInvariant()
+            switch ($cmd) {
+                's' {
+                    $path = Read-Host 'Session JSON path'
+                    if ([string]::IsNullOrWhiteSpace($path)) { $path = 'tax_session.json' }
+                    if (-not $path.EndsWith('.json')) { $path += '.json' }
+                    Save-Session -Path $path -Inputs $inputs -Step 0 -Section 0
+                    Write-Host "Saved: $path" -ForegroundColor Green
                 }
-                $report = Build-Report -Inputs $inputs -Cfg $cfg
-                $reportText = New-ReportText $report
-                Show-Header
-                Write-Host $reportText
-            }
-            'c' {
-                $path = Read-Host 'CSV path'
-                if ([string]::IsNullOrWhiteSpace($path)) { $path = 'tax_summary.csv' }
-                if (-not $path.EndsWith('.csv')) { $path += '.csv' }
-                Export-CSVReport -Path $path -R $report
-                Write-Host "CSV exported: $path" -ForegroundColor Green
-            }
-            'm' {
-                $path = Read-Host 'Markdown path'
-                if ([string]::IsNullOrWhiteSpace($path)) { $path = 'tax_summary.md' }
-                if (-not $path.EndsWith('.md')) { $path += '.md' }
-                Export-MarkdownReport -Path $path -R $report
-                Write-Host "Markdown exported: $path" -ForegroundColor Green
-            }
-            'r' {
-                Run-App
-                return
-            }
-            'q' {
-                return
-            }
-            default {
-                Write-Host 'Unknown command.' -ForegroundColor Yellow
+                'l' {
+                    $path = Read-Host 'Session JSON path'
+                    if ([string]::IsNullOrWhiteSpace($path)) { $path = 'tax_session.json' }
+                    if (-not $path.EndsWith('.json')) { $path += '.json' }
+                    $session = Load-Session -Path $path
+                    $loaded = $session.Inputs
+                    foreach ($k in $inputs.Keys) {
+                        if ($loaded.PSObject.Properties[$k]) {
+                            $inputs[$k] = [string]$loaded.$k
+                        }
+                    }
+                    $report = Build-Report -Inputs $inputs -Cfg $cfg
+                    Show-Report $report
+                }
+                'c' {
+                    $path = Read-Host 'CSV path'
+                    if ([string]::IsNullOrWhiteSpace($path)) { $path = 'tax_summary.csv' }
+                    if (-not $path.EndsWith('.csv')) { $path += '.csv' }
+                    Export-CSVReport -Path $path -R $report
+                    Write-Host "CSV exported: $path" -ForegroundColor Green
+                }
+                'm' {
+                    $path = Read-Host 'Markdown path'
+                    if ([string]::IsNullOrWhiteSpace($path)) { $path = 'tax_summary.md' }
+                    if (-not $path.EndsWith('.md')) { $path += '.md' }
+                    Export-MarkdownReport -Path $path -R $report
+                    Write-Host "Markdown exported: $path" -ForegroundColor Green
+                }
+                'p' {
+                    $path = Read-Host 'PDF path'
+                    if ([string]::IsNullOrWhiteSpace($path)) { $path = 'tax_summary.pdf' }
+                    if (-not $path.EndsWith('.pdf')) { $path += '.pdf' }
+                    Export-PdfReport -Path $path -R $report
+                    Write-Host "PDF exported: $path" -ForegroundColor Green
+                }
+                'r' {
+                    break
+                }
+                'q' {
+                    return
+                }
+                default {
+                    Write-Host 'Unknown command.' -ForegroundColor Yellow
+                }
             }
         }
     }
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    Run-App
+    Invoke-App
 }
