@@ -547,14 +547,18 @@ function Build-Report {
     }
 
     $monthlyGross = [double]$monthly.MonthlyGross
-    $annualCore = [math]::Round(([double]$monthly.GrossAllowance * 12))
-    $festivalBonusPerEid = [math]::Round(([double]$monthly.Basic * ($festivalBonusRate / 100.0)))
-    $annualBonus = [math]::Round($festivalBonusPerEid * $festivalBonusCount)
-    $annualGross = [math]::Round($salaryInputAnnual + $annualBonus)
     $annualHRA = [math]::Round(([double]$monthly.HRA * 12))
     $annualMedical = [math]::Round(([double]$monthly.Medical * 12))
     $annualFood = [math]::Round(([double]$monthly.Food * 12))
     $annualConveyance = [math]::Round(([double]$monthly.Conveyance * 12))
+
+    # Make the annual salary components add up exactly to the annual salary input.
+    # The yearly basic salary is the remainder after annual allowances are removed.
+    $annualCore = [math]::Round($salaryInputAnnual - $annualHRA - $annualMedical - $annualFood - $annualConveyance)
+
+    $festivalBonusPerEid = [math]::Round(([double]$monthly.Basic * ($festivalBonusRate / 100.0)))
+    $annualBonus = [math]::Round($festivalBonusPerEid * $festivalBonusCount)
+    $annualGross = [math]::Round($salaryInputAnnual + $annualBonus)
 
     $salaryExempt = [math]::Min($annualGross / 3.0, [double]$Cfg.SalaryExemptionCap)
     $taxableSalary = [math]::Max(0, $annualGross - $salaryExempt)
@@ -626,6 +630,7 @@ function Build-Report {
 
         SalaryInput = $salaryInputAnnual
         CustomSalary = $customSalary
+        AnnualBasicSalary = $annualCore
         BaseGrossSalary = $annualCore
         HouseRentAllowance = $annualHRA
         MedicalAllowance = $annualMedical
@@ -902,7 +907,7 @@ function Export-CSVReport {
         [pscustomobject]@{ Field='Monthly food allowance'; Value=(Format-Money $R.MonthlyFoodAllowance) }
         [pscustomobject]@{ Field='Monthly conveyance allowance'; Value=(Format-Money $R.MonthlyConveyanceAllowance) }
         [pscustomobject]@{ Field='Annual salary input'; Value=(Format-Money $R.SalaryInput) }
-        [pscustomobject]@{ Field='Base gross salary'; Value=(Format-Money $R.BaseGrossSalary) }
+        [pscustomobject]@{ Field='Annual basic salary'; Value=(Format-Money $R.BaseGrossSalary) }
         [pscustomobject]@{ Field='House rent allowance'; Value=(Format-Money $R.HouseRentAllowance) }
         [pscustomobject]@{ Field='Medical allowance'; Value=(Format-Money $R.MedicalAllowance) }
         [pscustomobject]@{ Field='Food allowance'; Value=(Format-Money $R.FoodAllowance) }
@@ -967,7 +972,7 @@ function Export-MarkdownReport {
     [void]$sb.AppendLine('|---|---:|')
     foreach ($pair in @(
         @('Annual salary input', $R.SalaryInput)
-        @('Base gross salary', $R.BaseGrossSalary)
+        @('Annual basic salary', $R.BaseGrossSalary)
         @('House rent allowance', $R.HouseRentAllowance)
         @('Medical allowance', $R.MedicalAllowance)
         @('Food allowance', $R.FoodAllowance)
@@ -1239,7 +1244,7 @@ function Show-Report {
 
     Write-Host 'ANNUALIZED SALARY / TAX' -ForegroundColor Cyan
     Write-Host ('{0,-34} Tk {1}' -f 'Annual salary input', (Format-Money $R.SalaryInput)) -ForegroundColor White
-    Write-Host ('{0,-34} Tk {1}' -f 'Base gross salary', (Format-Money $R.BaseGrossSalary)) -ForegroundColor White
+    Write-Host ('{0,-34} Tk {1}' -f 'Annual basic salary', (Format-Money $R.BaseGrossSalary)) -ForegroundColor White
     Write-Host ('{0,-34} Tk {1}' -f 'House rent allowance', (Format-Money $R.HouseRentAllowance)) -ForegroundColor White
     Write-Host ('{0,-34} Tk {1}' -f 'Medical allowance', (Format-Money $R.MedicalAllowance)) -ForegroundColor White
     Write-Host ('{0,-34} Tk {1}' -f 'Food allowance', (Format-Money $R.FoodAllowance)) -ForegroundColor White
